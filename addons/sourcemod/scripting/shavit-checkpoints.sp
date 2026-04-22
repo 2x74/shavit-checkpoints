@@ -1,9 +1,13 @@
 /*
- * shavit's Timer - Checkpoints
  * by: shavit, kidfearless, Nairda, GAMMA CASE, rumour, rtldg, sh4hrazad, Ciallo-Ani, olivia, Nuko, yupi2
+ * fork by: luna
+ *
+ * Changes from upstream:
+ *   - Segmented checkpoint limit is now configurable with no hard cap (0 = unlimited)
+ *   - Pause-on-teleport toggle in seg menu, unpauses on any input
+ *   - Fixed velocity being lost on the first teleport of a session
  *
  * This file is part of shavit's Timer (https://github.com/shavitush/bhoptimer)
- *
  *
  * This program is free software; you can redistribute it and/or modify it under
  * the terms of the GNU General Public License, version 3.0, as published by the
@@ -41,6 +45,7 @@
 
 #define CP_ANGLES				(1 << 0)
 #define CP_VELOCITY				(1 << 1)
+#define CP_PAUSE_ON_TELE		(1 << 2)	// pause on teleport toggle
 
 #define CP_DEFAULT				(CP_ANGLES|CP_VELOCITY)
 
@@ -60,6 +65,17 @@ enum struct persistent_data_t
 	cp_cache_t cpcache;
 }
 
+// used to re-apply velocity and physics state after pause/first-tele fix
+enum struct deferred_vel_t
+{
+	float fVelocity[3];
+	float fPosition[3];
+	int iMoveType;
+	float fGravity;
+	bool bPending;
+	timer_snapshot_t tSnapshot;	// reloaded on unpause to visually rewind the clock
+}
+
 char gS_Map[PLATFORM_MAX_PATH];
 char gS_PreviousMap[PLATFORM_MAX_PATH];
 EngineVersion gEV_Type = Engine_Unknown;
@@ -70,7 +86,7 @@ Convar gCV_UseOthers = null;
 Convar gCV_RestoreStates = null;
 Convar gCV_PersistData = null;
 Convar gCV_MaxCP = null;
-Convar gCV_MaxCP_Segmented = null;
+Convar gCV_MaxCP_Segmented = null;	// 0 = unlimited
 
 Handle gH_CheckpointsCookie = null;
 
@@ -93,12 +109,12 @@ int gI_CurrentCheckpoint[MAXPLAYERS+1];
 int gI_TimesTeleported[MAXPLAYERS+1];
 bool gB_InCheckpointMenu[MAXPLAYERS+1];
 
-int gI_UsingCheckpointsOwner[MAXPLAYERS+1]; // 0 = use player's own checkpoints
+int gI_UsingCheckpointsOwner[MAXPLAYERS+1];
 
 int gI_CheckpointsSettings[MAXPLAYERS+1];
 
 // save states
-bool gB_SaveStates[MAXPLAYERS+1]; // whether we have data for when player rejoins from spec
+bool gB_SaveStates[MAXPLAYERS+1];
 ArrayList gA_PersistentData = null;
 
 bool gB_Eventqueuefix = false;
@@ -114,13 +130,19 @@ int gI_Offset_m_lastLadderPos = 0;
 int gI_Offset_m_afButtonDisabled = 0;
 int gI_Offset_m_afButtonForced = 0;
 
+// per-client deferred velocity for first-tele and pause fix
+deferred_vel_t gDV_DeferredVelocity[MAXPLAYERS+1];
+
+// per-client pause-on-tele state
+bool gB_PausedOnTele[MAXPLAYERS+1];
+
 public Plugin myinfo =
 {
 	name = "[shavit] Checkpoints",
-	author = "shavit, KiD Fearless, Nairda, GAMMA CASE, rumour, rtldg, sh4hrazad, Ciallo-Ani, olivia, Nuko, yupi2",
+	author = "shavit, KiD Fearless, Nairda, GAMMA CASE, rumour, rtldg, sh4hrazad, Ciallo-Ani, olivia, Nuko, yupi2, luna",
 	description = "Checkpoints for shavit's bhop timer.",
 	version = SHAVIT_VERSION,
-	url = "https://github.com/shavitush/bhoptimer"
+	url = "https://github.com/2x74/shavit-segmented-improved"
 }
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int err_max)
@@ -207,7 +229,10 @@ public void OnPluginStart()
 	gCV_UseOthers = new Convar("shavit_checkpoints_useothers", "1", "Allow players to use or duplicate another player's checkpoints.", 0, true, 0.0, true, 1.0);
 	gCV_RestoreStates = new Convar("shavit_checkpoints_restorestates", "1", "Save the players' timer/position etc.. when they die/change teams,\nand load the data when they spawn?\n0 - Disabled\n1 - Enabled", 0, true, 0.0, true, 1.0);
 	gCV_MaxCP = new Convar("shavit_checkpoints_maxcp", "1000", "Maximum amount of checkpoints.\nNote: Very high values will result in high memory usage!", 0, true, 1.0, true, 10000.0);
-	gCV_MaxCP_Segmented = new Convar("shavit_checkpoints_maxcp_seg", "10", "Maximum amount of segmented checkpoints. Make this less or equal to shavit_checkpoints_maxcp.\nNote: Very high values will result in HUGE memory usage! Segmented checkpoints contain frame data!", 0, true, 1.0, true, 50.0);
+
+	// removed hard upper cap. 0 = unlimited. server ops should be careful with memory.
+	gCV_MaxCP_Segmented = new Convar("shavit_checkpoints_maxcp_seg", "500", "Maximum amount of segmented checkpoints. 0 = unlimited.\nMake this less or equal to shavit_checkpoints_maxcp.\nNote: Very high values will result in HUGE memory usage! Segmented checkpoints contain frame data!", 0, true, 0.0);
+
 	gCV_PersistData = new Convar("shavit_checkpoints_persistdata", "600", "How long to persist timer data for disconnected users in seconds?\n-1 - Until map change\n0 - Disabled", 0, true, -1.0);
 
 	Convar.AutoExecConfig();
@@ -217,7 +242,6 @@ public void OnPluginStart()
 
 	LoadDHooks();
 
-	// modules
 	gB_Eventqueuefix = LibraryExists("eventqueuefix");
 	gB_ReplayRecorder = LibraryExists("shavit-replay-recorder");
 
@@ -268,8 +292,6 @@ void LoadDHooks()
 	}
 
 	int instr = LoadFromAddress(buttonsSig, NumberType_Int32);
-	// The lowest two bytes are the beginning of a `mov`.
-	// The offset is 100% definitely totally always 16-bit.
 	gI_Offset_m_afButtonDisabled = instr >> 16;
 	gI_Offset_m_afButtonForced = gI_Offset_m_afButtonDisabled + 4;
 
@@ -369,9 +391,9 @@ public void Shavit_OnPause(int client, int track)
 
 public void Shavit_OnResume(int client, int track)
 {
-	if (gB_SaveStates[client])
+	// if the resume was triggered by our pause-on-tele, don't load persistent data
+	if (gB_SaveStates[client] && !gB_PausedOnTele[client])
 	{
-		// events&outputs won't work properly unless we do this next frame...
 		RequestFrame(LoadPersistentData, GetClientSerial(client));
 	}
 }
@@ -401,7 +423,6 @@ public Action Command_Jointeam(int client, const char[] command, int args)
 
 public MRESReturn CBasePlayer__CommitSuicide(int client, DHookParam params)
 {
-	//bool bExplode = params.Get(1);
 	bool bForce = params.Get(2);
 
 	if (IsPlayerAlive(client) && (bForce || gF_NextSuicide[client] <= GetGameTime()))
@@ -476,13 +497,15 @@ public void OnClientCookiesCached(int client)
 		gI_CheckpointsSettings[client] = StringToInt(sSetting);
 	}
 
-	// TODO: BAD
 	gI_Style[client] = Shavit_GetBhopStyle(client);
 }
 
 public void OnClientPutInServer(int client)
 {
 	gF_NextSuicide[client] = GetGameTime();
+
+	gDV_DeferredVelocity[client].bPending = false;
+	gB_PausedOnTele[client] = false;
 
 	if (IsFakeClient(client))
 	{
@@ -491,7 +514,7 @@ public void OnClientPutInServer(int client)
 
 	if (gH_CommitSuicide != null)
 	{
-		gH_CommitSuicide.HookEntity(Hook_Pre,  client, CBasePlayer__CommitSuicide);
+		gH_CommitSuicide.HookEntity(Hook_Pre, client, CBasePlayer__CommitSuicide);
 	}
 
 	if (!AreClientCookiesCached(client))
@@ -531,12 +554,43 @@ public void OnClientDisconnect(int client)
 
 	gI_UsingCheckpointsOwner[client] = 0;
 	gB_InCheckpointMenu[client] = false;
+	gB_PausedOnTele[client] = false;
+	gDV_DeferredVelocity[client].bPending = false;
 
 	PersistData(client, true);
 
-	// if data wasn't persisted, then we have checkpoints to reset...
 	ResetCheckpoints(client);
 	delete gA_Checkpoints[client];
+}
+
+public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon, int &subtype, int &cmdnum, int &tickcount, int &seed, int mouse[2])
+{
+	if (gB_PausedOnTele[client])
+	{
+		if (buttons != 0)
+		{
+			Shavit_LoadSnapshot(client, gDV_DeferredVelocity[client].tSnapshot, sizeof(timer_snapshot_t), true);
+			SetEntityMoveType(client, view_as<MoveType>(gDV_DeferredVelocity[client].iMoveType));
+			SetEntityGravity(client, gDV_DeferredVelocity[client].fGravity);
+			TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, gDV_DeferredVelocity[client].fVelocity);
+		}
+		else
+		{
+			// Anchor: reset position and zero velocity every tick so gravity/physics can't move them
+			TeleportEntity(client, gDV_DeferredVelocity[client].fPosition, NULL_VECTOR, view_as<float>({0.0, 0.0, 0.0}));
+			vel[0] = 0.0; vel[1] = 0.0; vel[2] = 0.0;
+			return Plugin_Changed;
+		}
+	}
+
+	// first-tele speed fix — apply saved velocity on the next cmd after teleport
+	if (gDV_DeferredVelocity[client].bPending)
+	{
+		gDV_DeferredVelocity[client].bPending = false;
+		TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, gDV_DeferredVelocity[client].fVelocity);
+	}
+
+	return Plugin_Continue;
 }
 
 void DeletePersistentDataFromClient(int client)
@@ -566,8 +620,6 @@ public void Shavit_OnStyleChanged(int client, int oldstyle, int newstyle, int tr
 
 	if (bSegmented || bKzcheckpoints)
 	{
-		// Gammacase somehow had this callback fire before OnClientPutInServer.
-		// OnClientPutInServer will still fire but we need a valid arraylist in the mean time.
 		if(gA_Checkpoints[client] == null)
 		{
 			gA_Checkpoints[client] = new ArrayList(sizeof(cp_cache_t));
@@ -591,7 +643,6 @@ public Action Shavit_OnStart(int client)
 {
 	gI_TimesTeleported[client] = 0;
 
-	// shavit-kz
 	if(Shavit_GetStyleSettingBool(gI_Style[client], "kzcheckpoints"))
 	{
 		ResetCheckpoints(client);
@@ -627,7 +678,6 @@ public void Player_Spawn(Event event, const char[] name, bool dontBroadcast)
 	{
 		if(gCV_RestoreStates.BoolValue)
 		{
-			// events&outputs won't work properly unless we do this next frame...
 			RequestFrame(LoadPersistentData, serial);
 		}
 	}
@@ -639,12 +689,10 @@ public void Player_Spawn(Event event, const char[] name, bool dontBroadcast)
 		if (iIndex != -1)
 		{
 			gB_SaveStates[client] = true;
-			// events&outputs won't work properly unless we do this next frame...
 			RequestFrame(LoadPersistentData, serial);
 		}
 	}
 
-	// refreshes kz cp menu if there is nothing open
 	if (gB_InCheckpointMenu[client] &&
 		Shavit_GetStyleSettingInt(gI_Style[client], "kzcheckpoints") &&
 		GetClientMenu(client, null) == MenuSource_None &&
@@ -676,7 +724,17 @@ bool CanSegment(int client)
 
 int GetMaxCPs(int client)
 {
-	return CanSegment(client)? gCV_MaxCP_Segmented.IntValue:gCV_MaxCP.IntValue;
+	if (CanSegment(client))
+	{
+		int iSegMax = gCV_MaxCP_Segmented.IntValue;
+		return (iSegMax == 0) ? 0 : iSegMax;	// 0 = unlimited
+	}
+	return gCV_MaxCP.IntValue;
+}
+
+bool IsUnlimitedCPs(int client)
+{
+	return CanSegment(client) && gCV_MaxCP_Segmented.IntValue == 0;
 }
 
 int FindPersistentData(int client, persistent_data_t aData)
@@ -703,7 +761,6 @@ void PersistData(int client, bool disconnected)
 		(!IsPlayerAlive(client) && !disconnected) ||
 		(!IsPlayerAlive(client) && disconnected && !gB_SaveStates[client]) ||
 		GetSteamAccountID(client) == 0 ||
-		//Shavit_GetTimerStatus(client) == Timer_Stopped ||
 		(!gCV_RestoreStates.BoolValue && !disconnected) ||
 		(gCV_PersistData.IntValue == 0 && disconnected))
 	{
@@ -857,7 +914,7 @@ public Action Command_Checkpoints(int client, int args)
 		return Plugin_Handled;
 	}
 
-	if (!gA_Checkpoints[client]) // probably got here from another plugin doing `FakeClientCommandEx(param1, "sm_checkpoints");` too early or too late
+	if (!gA_Checkpoints[client])
 	{
 		return Plugin_Handled;
 	}
@@ -879,6 +936,14 @@ public Action Command_Save(int client, int args)
 	if(!gCV_Checkpoints.BoolValue && !bSegmenting)
 	{
 		Shavit_PrintToChat(client, "%T", "FeatureDisabled", client, gS_ChatStrings.sWarning, gS_ChatStrings.sText);
+
+		return Plugin_Handled;
+	}
+
+	// bypass block if in the custom suspended state
+	if(Shavit_IsPaused(client) && !gB_PausedOnTele[client])
+	{
+		Shavit_PrintToChat(client, "%T", "CommandNoPause", client, gS_ChatStrings.sVariable, gS_ChatStrings.sText);
 
 		return Plugin_Handled;
 	}
@@ -912,6 +977,14 @@ public Action Command_Tele(int client, int args)
 		return Plugin_Handled;
 	}
 
+	// bypass block if in the custom suspended state
+	if(Shavit_IsPaused(client) && !gB_PausedOnTele[client])
+	{
+		Shavit_PrintToChat(client, "%T", "CommandNoPause", client, gS_ChatStrings.sVariable, gS_ChatStrings.sText);
+
+		return Plugin_Handled;
+	}
+
 	int index = gI_CurrentCheckpoint[client];
 
 	if(args > 0)
@@ -921,7 +994,7 @@ public Action Command_Tele(int client, int args)
 
 		int parsed = StringToInt(arg);
 
-		if(0 < parsed <= gCV_MaxCP.IntValue)
+		if(parsed > 0)
 		{
 			index = parsed;
 		}
@@ -1072,10 +1145,19 @@ void OpenCPMenu(int client)
 	}
 
 	char sDisplay[64];
+	int iMaxCPs = GetMaxCPs(client);
 	int newcount = gA_Checkpoints[client].Length + 1;
-	int maxcps = GetMaxCPs(client);
 
-	FormatEx(sDisplay, 64, "%T", (iUsingOwner == client) ? "MiscCheckpointSave" : "MiscCheckpointDuplicate", client, (newcount > maxcps ? maxcps : newcount), maxcps);
+	// show unlimited or capped count in save button
+	if (IsUnlimitedCPs(client))
+	{
+		FormatEx(sDisplay, 64, "%T [%d | unlimited]", (iUsingOwner == client) ? "MiscCheckpointSave" : "MiscCheckpointDuplicate", client, newcount);
+	}
+	else
+	{
+		FormatEx(sDisplay, 64, "%T", (iUsingOwner == client) ? "MiscCheckpointSave" : "MiscCheckpointDuplicate", client, (newcount > iMaxCPs ? iMaxCPs : newcount), iMaxCPs);
+	}
+
 	menu.AddItem("save", sDisplay, (iUsingOwner == client || gA_Checkpoints[iUsingOwner].Length > 0) ? ITEMDRAW_DEFAULT:ITEMDRAW_DISABLED);
 
 	if (gA_Checkpoints[iUsingOwner].Length > 0)
@@ -1095,15 +1177,11 @@ void OpenCPMenu(int client)
 	FormatEx(sDisplay, 64, "%T%s", "MiscCheckpointNext", client, (bKzcheckpoints) ? "" : "\n ");
 	menu.AddItem("next", sDisplay, (gI_CurrentCheckpoint[client] < gA_Checkpoints[iUsingOwner].Length) ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
 
-
 	if((Shavit_CanPause(client) & CPR_ByConVar) == 0 && bKzcheckpoints)
 	{
 		FormatEx(sDisplay, 64, "%T", "MiscCheckpointPause", client);
 		menu.AddItem("pause", sDisplay);
 	}
-
-	// apparently this is the fix
-	// menu.AddItem("spacer", "", ITEMDRAW_RAWLINE);
 
 	bool tas_timescale = (Shavit_GetStyleSettingFloat(Shavit_GetBhopStyle(client), "tas_timescale") == -1.0);
 
@@ -1149,6 +1227,15 @@ void OpenCPMenu(int client)
 
 			IntToString(CP_VELOCITY, sInfo, 16);
 			FormatEx(sDisplay, 64, "%T", "MiscCheckpointUseVelocity", client);
+			menu.AddItem(sInfo, sDisplay);
+		}
+
+		// if anyone is reading this i'm lwk tired as fuck
+		if (bSegmented || tas_timescale)
+		{
+			char sInfo[16];
+			IntToString(CP_PAUSE_ON_TELE, sInfo, 16);
+			FormatEx(sDisplay, 64, "Pause on teleport\n ");
 			menu.AddItem(sInfo, sDisplay);
 		}
 	}
@@ -1444,8 +1531,6 @@ public int MenuHandler_CheckpointsDelete(Menu menu, MenuAction action, int param
 
 bool SaveCheckpoint(int client, bool duplicate = false)
 {
-	// ???
-	// nairda somehow triggered an error that requires this
 	if(!IsValidClient(client))
 	{
 		return false;
@@ -1455,7 +1540,6 @@ bool SaveCheckpoint(int client, bool duplicate = false)
 
 	if (target > MaxClients)
 	{
-		// TODO: Replay_Prop...
 		return false;
 	}
 
@@ -1466,7 +1550,8 @@ bool SaveCheckpoint(int client, bool duplicate = false)
 		return false;
 	}
 
-	if(Shavit_IsPaused(client) || Shavit_IsPaused(target))
+	// bypass pause check if ur currently suspended
+	if(Shavit_IsPaused(client) && !gB_PausedOnTele[client])
 	{
 		Shavit_PrintToChat(client, "%T", "CommandNoPause", client, gS_ChatStrings.sVariable, gS_ChatStrings.sText);
 
@@ -1508,7 +1593,8 @@ bool SaveCheckpoint(int client, bool duplicate = false)
 	}
 
 	int iMaxCPs = GetMaxCPs(client);
-	bool overflow = (gA_Checkpoints[client].Length >= iMaxCPs);
+	// if unlimited (0), never overflow
+	bool overflow = (iMaxCPs > 0 && gA_Checkpoints[client].Length >= iMaxCPs);
 	int index = (overflow ? iMaxCPs : gA_Checkpoints[client].Length+1);
 
 	Action result = Plugin_Continue;
@@ -1656,7 +1742,6 @@ void SaveCheckpointCache(int saver, int target, cp_cache_t cpcache, int index, H
 
 	if(IsFakeClient(target))
 	{
-		// unfortunately replay bots don't have a snapshot, so we can generate a fake one
 		snapshot.bTimerEnabled = true;
 		snapshot.fCurrentTime = Shavit_GetReplayTime(target);
 		snapshot.bClientPaused = false;
@@ -1734,13 +1819,6 @@ void SaveCheckpointCache(int saver, int target, cp_cache_t cpcache, int index, H
 
 	cpcache.iSteamID = GetSteamAccountID(target);
 
-#if 0
-	if (cpcache.iSteamID != GetSteamAccountID(saver))
-	{
-		cpcache.aSnapshot.bPracticeMode = true;
-	}
-#endif
-
 	StringMap cd = new StringMap();
 
 	if (plugin != INVALID_HANDLE)
@@ -1763,12 +1841,16 @@ void SaveCheckpointCache(int saver, int target, cp_cache_t cpcache, int index, H
 
 void TeleportToCheckpoint(int client, int index, bool suppressMessage, int target=0)
 {
-	if(index < 1 || index > gCV_MaxCP.IntValue || (!gCV_Checkpoints.BoolValue && !CanSegment(client)))
+	int iMaxCPs = GetMaxCPs(client);
+
+	// if limited, validate against max. if unlimited (0), only validate lower bound.
+	if(index < 1 || (iMaxCPs > 0 && index > iMaxCPs) || (!gCV_Checkpoints.BoolValue && !CanSegment(client)))
 	{
 		return;
 	}
 
-	if(Shavit_IsPaused(client))
+	// Bypass block if we are in the custom suspended state
+	if(Shavit_IsPaused(client) && !gB_PausedOnTele[client])
 	{
 		Shavit_PrintToChat(client, "%T", "CommandNoPause", client, gS_ChatStrings.sVariable, gS_ChatStrings.sText);
 
@@ -1826,15 +1908,12 @@ void TeleportToCheckpoint(int client, int index, bool suppressMessage, int targe
 		return;
 	}
 
-	Shavit_ResumeTimer(client);
-
 	Call_StartForward(gH_Forwards_OnTeleport);
 	Call_PushCell(client);
 	Call_PushCell(index);
 	Call_PushCell(target);
 	Call_Finish();
 
-	// shavit-kz
 	if(bKzcheckpoints)
 	{
 		UpdateKZStyle(client, TimerAction_OnTeleport);
@@ -1846,10 +1925,8 @@ void TeleportToCheckpoint(int client, int index, bool suppressMessage, int targe
 	}
 }
 
-// index = -1 when persistent data. index = 0 when Shavit_LoadCheckpointCache() usually. index > 0 when "actually a checkpoint"
 bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force = false)
 {
-	// ripped this out and put it here since Shavit_LoadSnapshot() checks this and we want to bail early if LoadSnapShot would fail
 	if (!force && !Shavit_HasStyleAccess(client, cpcache.aSnapshot.bsStyle))
 	{
 		return false;
@@ -1857,7 +1934,7 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 
 	bool isPersistentData = (index == -1);
 
-	SetEntityMoveType(client, cpcache.iMoveType);
+	// basic state restoration
 	SetEntityFlags(client, cpcache.iFlags);
 
 	int ground = (cpcache.iGroundEntity != -1) ? EntRefToEntIndex(cpcache.iGroundEntity) : -1;
@@ -1891,9 +1968,10 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 	SetEntData(client, gI_Offset_m_afButtonDisabled, cpcache.m_afButtonDisabled);
 	SetEntData(client, gI_Offset_m_afButtonForced, cpcache.m_afButtonForced);
 
-	// this is basically the same as normal checkpoints except much less data is used
+	// kz
 	if(!isPersistentData && Shavit_GetStyleSettingInt(gI_Style[client], "kzcheckpoints"))
 	{
+		SetEntityMoveType(client, cpcache.iMoveType);
 		TeleportEntity(client, cpcache.fPosition, cpcache.fAngles, view_as<float>({ 0.0, 0.0, 0.0 }));
 
 		Call_StartForward(gH_Forwards_OnCheckpointCacheLoaded);
@@ -1908,8 +1986,6 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 	if (cpcache.aSnapshot.iFullTicks > 0 && (cpcache.aSnapshot.bPracticeMode || !(cpcache.bSegmented || isPersistentData) || GetSteamAccountID(client) != cpcache.iSteamID))
 	{
 		cpcache.aSnapshot.bPracticeMode = true;
-
-		// Do this here to trigger practice mode alert
 		Shavit_SetPracticeMode(client, true, true);
 	}
 
@@ -1919,11 +1995,58 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 	SetEntPropString(client, Prop_Data, "m_iName", cpcache.sTargetname);
 	SetEntPropString(client, Prop_Data, "m_iClassname", cpcache.sClassname);
 
-	TeleportEntity(client, cpcache.fPosition,
-		((gI_CheckpointsSettings[client] & CP_ANGLES)   > 0 || cpcache.bSegmented || isPersistentData) ? cpcache.fAngles   : NULL_VECTOR,
-		((gI_CheckpointsSettings[client] & CP_VELOCITY) > 0 || cpcache.bSegmented || isPersistentData) ? cpcache.fVelocity : NULL_VECTOR);
+	float fVelocity[3];
+	bool bRestoreVelocity = ((gI_CheckpointsSettings[client] & CP_VELOCITY) > 0 || cpcache.bSegmented || isPersistentData);
 
-	// Used to trigger all endtouch booster events which are then wiped via eventqueuefix :)
+	if (bRestoreVelocity)
+	{
+		fVelocity = cpcache.fVelocity;
+	}
+
+	// pause on tele logic
+	bool bTasTsStyle = (Shavit_GetStyleSettingFloat(gI_Style[client], "tas_timescale") == -1.0);
+	bool bShouldPause = ((CanSegment(client) || bTasTsStyle) && (gI_CheckpointsSettings[client] & CP_PAUSE_ON_TELE) > 0 && !isPersistentData);
+
+	if (bShouldPause)
+	{
+		gB_PausedOnTele[client] = true;
+
+		// Store momentum, physics state, and CP timer snapshot for restoration on input
+		gDV_DeferredVelocity[client].fVelocity = fVelocity;
+		gDV_DeferredVelocity[client].fPosition = cpcache.fPosition;
+		gDV_DeferredVelocity[client].iMoveType = cpcache.iMoveType;
+		gDV_DeferredVelocity[client].fGravity = cpcache.fGravity;
+		gDV_DeferredVelocity[client].bPending = false;
+		gDV_DeferredVelocity[client].tSnapshot = cpcache.aSnapshot;	// used to rewind timer display on unpause
+
+		// tp shit
+		TeleportEntity(client, cpcache.fPosition,
+			((gI_CheckpointsSettings[client] & CP_ANGLES) > 0 || cpcache.bSegmented || isPersistentData) ? cpcache.fAngles : NULL_VECTOR,
+			view_as<float>({0.0, 0.0, 0.0}));
+
+		// FUCK SHAVIT_PAUSETIMER
+		SetEntityMoveType(client, MOVETYPE_WALK);
+		SetEntityGravity(client, 0.0);
+	}
+	else
+	{
+		SetEntityMoveType(client, view_as<MoveType>(cpcache.iMoveType));
+		SetEntityGravity(client, cpcache.fGravity);
+
+		TeleportEntity(client, cpcache.fPosition,
+			((gI_CheckpointsSettings[client] & CP_ANGLES) > 0 || cpcache.bSegmented || isPersistentData) ? cpcache.fAngles : NULL_VECTOR,
+			bRestoreVelocity ? fVelocity : NULL_VECTOR);
+
+		// first-tele speed fix — defer velocity application to next frame if not pausing
+		if (bRestoreVelocity && gI_TimesTeleported[client] == 1)
+		{
+			gDV_DeferredVelocity[client].fVelocity = fVelocity;
+			gDV_DeferredVelocity[client].bPending = true;
+		}
+
+		Shavit_ResumeTimer(client);
+	}
+
 	MaybeDoPhysicsUntouch(client);
 
 	if (!cpcache.aSnapshot.bPracticeMode)
@@ -1934,11 +2057,8 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 		}
 	}
 
-	SetEntityGravity(client, cpcache.fGravity);
-
 	if (gB_ReplayRecorder && cpcache.aFrames != null)
 	{
-		// if isPersistentData, then CloneHandle() is done instead of ArrayList.Clone()
 		Shavit_SetReplayData(client, cpcache.aFrames, isPersistentData);
 		Shavit_SetPlayerPreFrames(client, cpcache.iPreFrames);
 	}
@@ -1950,17 +2070,6 @@ bool LoadCheckpointCache(int client, cp_cache_t cpcache, int index, bool force =
 		ep.outputWaits = cpcache.aOutputWaits;
 		ep.OnUser1_4 = cpcache.aOnUser1_4;
 		SetClientEvents(client, ep);
-
-#if DEBUG
-		PrintToConsole(client, "targetname='%s'", cpcache.sTargetname);
-
-		for (int i = 0; i < cpcache.aEvents.Length; i++)
-		{
-			event_t e;
-			cpcache.aEvents.GetArray(i, e);
-			PrintToConsole(client, "%s %s %s %f %i %i %i", e.target, e.targetInput, e.variantValue, e.delay, e.activator, e.caller, e.outputID);
-		}
-#endif
 	}
 
 	Call_StartForward(gH_Forwards_OnCheckpointCacheLoaded);
@@ -2069,12 +2178,13 @@ public any Native_SetCheckpoint(Handle plugin, int numParams)
 		position = numcps + 1;
 	}
 
-	if (position == 0 && numcps >= maxcps)
+	// 0 = no limit
+	if (position == 0 && maxcps > 0 && numcps >= maxcps)
 	{
 		return false;
 	}
 
-	if (position > maxcps)
+	if (maxcps > 0 && position > maxcps)
 	{
 		return false;
 	}
@@ -2088,7 +2198,7 @@ public any Native_SetCheckpoint(Handle plugin, int numParams)
 	if (cpcache.aOutputWaits)
 		cpcache.aOutputWaits = cheapCloneHandle ? view_as<ArrayList>(CloneHandle(cpcache.aOutputWaits)) : cpcache.aOutputWaits.Clone();
 	if (cpcache.customdata)
-		cpcache.customdata = view_as<StringMap>(CloneHandle(cpcache.customdata)); //cheapCloneHandle ? view_as<StringMap>(CloneHandle(cpcache.customdata)) : cpcache.customdata.Clone();
+		cpcache.customdata = view_as<StringMap>(CloneHandle(cpcache.customdata));
 
 	if (numcps == 0)
 	{
@@ -2189,8 +2299,9 @@ public any Native_SetCurrentCheckpoint(Handle plugin, int numParams)
 public any Native_SaveCheckpoint(Handle plugin, int numParams)
 {
 	int client = GetNativeCell(1);
+	int maxcps = GetMaxCPs(client);
 
-	if(!CanSegment(client) && gA_Checkpoints[client].Length >= GetMaxCPs(client))
+	if(!CanSegment(client) && maxcps > 0 && gA_Checkpoints[client].Length >= maxcps)
 	{
 		return -1;
 	}
